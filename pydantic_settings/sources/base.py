@@ -392,7 +392,7 @@ class DefaultSettingsSource(PydanticBaseSettingsSource):
                 if is_dataclass(type(field_info.default)):
                     self.defaults[preferred_alias] = asdict(field_info.default)
                 elif is_model_class(type(field_info.default)):
-                    self.defaults[preferred_alias] = field_info.default.model_dump()
+                    self.defaults[preferred_alias] = field_info.default.model_dump(round_trip=True)
                 if discriminator is not None and preferred_alias in self.defaults:
                     default_cls = type(field_info.default)
                     self._discriminator_tags[preferred_alias] = [
@@ -502,7 +502,7 @@ class InitSettingsSource(PydanticBaseSettingsSource):
 
     def __call__(self) -> dict[str, Any]:
         return (
-            TypeAdapter(dict[str, Any]).dump_python(self.init_kwargs)
+            TypeAdapter(dict[str, Any]).dump_python(self.init_kwargs, round_trip=True)
             if self.nested_model_default_partial_update
             else self.init_kwargs
         )

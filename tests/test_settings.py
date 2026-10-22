@@ -39,10 +39,13 @@ from pydantic import (
     RootModel,
     Secret,
     SecretStr,
+    SerializationInfo,
     StrictBool,
     StrictInt,
     Tag,
     ValidationError,
+    computed_field,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -1244,6 +1247,191 @@ def test_class_nested_model_default_partial_update(env):
         'nested_c': {'v0': True, 'v1': True},
         'nested_d': {'v0': True, 'v1': True},
     }
+
+
+@pytest.mark.parametrize('use_init_instance', [False, True])
+@pytest.mark.parametrize('deep', [False, True])
+def test_nested_model_default_partial_update_computed_fields(env, use_init_instance, deep):
+    class Database(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        host: str = 'localhost'
+        port: int = 5432
+
+        @computed_field
+        @property
+        def address(self) -> str:
+            return f'{self.host}:{self.port}'
+
+    class Wrapper(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        database: Database = Database()
+
+    nested_type = Wrapper if deep else Database
+
+    class Settings(BaseSettings, env_nested_delimiter='__', nested_model_default_partial_update=True):
+        nested: nested_type = nested_type()
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+        ):
+            return env_settings, init_settings, dotenv_settings, file_secret_settings
+
+    assert not Settings().model_fields_set
+    kwargs = {'nested': nested_type()} if use_init_instance else {}
+    env.set('NESTED__DATABASE__PORT' if deep else 'NESTED__PORT', '6000')
+    result = Settings(**kwargs)
+    database = result.nested.database if deep else result.nested
+    assert database.port == 6000
+    assert database.address == 'localhost:6000'
+
+
+@pytest.mark.parametrize('partial_update', [False, True])
+@pytest.mark.parametrize('source', ['env', 'init'])
+def test_nested_model_default_partial_update_computed_fields_rejects_user_input(env, partial_update, source):
+    class Nested(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        value: int = 1
+
+        @computed_field
+        @property
+        def doubled(self) -> int:
+            return self.value * 2
+
+    class Settings(BaseSettings, env_nested_delimiter='__', nested_model_default_partial_update=partial_update):
+        nested: Nested = Nested()
+
+    if source == 'env':
+        env.set('NESTED__DOUBLED', 'invalid')
+        kwargs = {}
+    else:
+        kwargs = {'nested': {'doubled': 'invalid'}}
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(**kwargs)
+    assert [(error['loc'], error['type']) for error in exc_info.value.errors()] == [
+        (('nested', 'doubled'), 'extra_forbidden')
+    ]
+
+
+@pytest.mark.parametrize('use_init_instance', [False, True])
+def test_nested_model_default_partial_update_json_round_trip(env, use_init_instance):
+    class Nested(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        data: Json[list[int]]
+        value: int = 1
+
+        @computed_field
+        @property
+        def total(self) -> int:
+            return sum(self.data)
+
+    class Settings(BaseSettings, env_nested_delimiter='__', nested_model_default_partial_update=True):
+        nested: Nested = Nested(data='[1, 2]')
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+        ):
+            return env_settings, init_settings, dotenv_settings, file_secret_settings
+
+    env.set('NESTED__VALUE', '2')
+    kwargs = {'nested': Nested(data='[1, 2]')} if use_init_instance else {}
+    result = Settings(**kwargs)
+    assert result.nested.model_dump() == {'data': [1, 2], 'value': 2, 'total': 3}
+
+
+@pytest.mark.parametrize('use_init_instance', [False, True])
+@pytest.mark.parametrize('when_used', ['always', 'json'])
+def test_nested_model_default_partial_update_round_trip_serializer(env, use_init_instance, when_used):
+    round_trips = []
+
+    class Nested(BaseModel):
+        value: int = 7
+        other: int = 1
+
+        @field_serializer('value', when_used=when_used)
+        def serialize_value(self, value: int, info: SerializationInfo):
+            round_trips.append(info.round_trip)
+            return value if info.round_trip else f'value={value}'
+
+    class Settings(BaseSettings, env_nested_delimiter='__', nested_model_default_partial_update=True):
+        nested: Nested = Nested()
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+        ):
+            return env_settings, init_settings, dotenv_settings, file_secret_settings
+
+    env.set('NESTED__OTHER', '2')
+    kwargs = {'nested': Nested()} if use_init_instance else {}
+    result = Settings(**kwargs)
+    assert (result.nested.value, result.nested.other) == (7, 2)
+    assert all(round_trips)
+    assert bool(round_trips) is (when_used == 'always')
+    assert result.nested.model_dump(mode='json') == {'value': 'value=7', 'other': 2}
+    assert round_trips[-1] is False
+
+
+def test_nested_model_default_partial_update_computed_fields_preserves_factory(env):
+    factory_calls = []
+
+    def ids_factory():
+        factory_calls.append(None)
+        return [7]
+
+    class Nested(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        version: int = 1
+        ids: list[int] = Field(default_factory=ids_factory)
+
+        @computed_field
+        @property
+        def total(self) -> int:
+            return sum(self.ids)
+
+    default = Nested()
+
+    class Settings(BaseSettings, env_nested_delimiter='__', nested_model_default_partial_update=True):
+        nested: Nested | None = default
+
+    assert Settings().model_dump(exclude_unset=True) == {}
+    env.set('NESTED__VERSION', '2')
+    result = Settings()
+    assert result.nested.model_fields_set == {'version', 'ids'}
+    assert result.model_dump(exclude_unset=True) == {'nested': {'version': 2, 'ids': [7], 'total': 7}}
+    assert Settings(nested=None).nested is None
+    assert factory_calls == [None]
+    assert default.version == 1
+
+
+@pytest.mark.parametrize('use_init_instance', [False, True])
+@pytest.mark.parametrize('dataclass_decorator', [dataclasses.dataclass, pydantic_dataclasses.dataclass])
+def test_nested_model_default_partial_update_computed_dataclass(env, use_init_instance, dataclass_decorator):
+    @dataclass_decorator
+    class Nested:
+        __pydantic_config__ = ConfigDict(extra='forbid')
+        value: int = 1
+
+        @computed_field
+        @property
+        def doubled(self) -> int:
+            return self.value * 2
+
+    class Settings(BaseSettings, env_nested_delimiter='__', nested_model_default_partial_update=True):
+        nested: Nested = Nested()
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+        ):
+            return env_settings, init_settings, dotenv_settings, file_secret_settings
+
+    env.set('NESTED__VALUE', '2')
+    kwargs = {'nested': Nested()} if use_init_instance else {}
+    result = Settings(**kwargs)
+    assert result.nested.value == 2
+    assert result.nested.doubled == 4
 
 
 def test_nested_model_default_partial_update_validation_alias_differs_from_alias(env):
